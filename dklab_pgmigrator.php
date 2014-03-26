@@ -3,16 +3,16 @@
  * Complete PostgreSQL live scheme migration tool based on apgdiff utility.
  * (C) Dmitry Koterov, http://en.dklab.ru/lib/dklab_pgmigrator/
  *
- * @version 1.10
+ * @version 1.13
  */
 
- 
+
 // If we call this script directly via command-line, run main() method.
 if ($_SERVER['argv'][0] == basename(__FILE__)) dklab_pgmigrator::main();
 
 /**
  * Class to perform the migration procedure. You may instantiate this 
- * class and call execute() if you do not like comment-line interface.
+ * class and call execute() if you do not like command-line interface.
  */
 class dklab_pgmigrator
 {
@@ -28,26 +28,34 @@ class dklab_pgmigrator
         \\set ON_ERROR_STOP on
         \\set VERBOSITY terse
         SET client_min_messages TO warning;
+        SET statement_timeout TO 20000;
     ";
-    
+
     /**
      * RE to clean from the dumps before diffing them.
      */
-	private $_reDiffClean = '{
+    private $_reDiffClean = '{
         ^[ \t]* START \s+ WITH \s+ \d+ [ \t]*\r?\n
-  	    | ^CREATE \s+ TYPE \s+ \S* "?enum_migration_version"? [\s\S]*? \);
-  	    | ^SET \s+ default_with_oids \s* = \s* (true|false);
-   	}mxi';
+        | ^CREATE \s+ TYPE \s+ \S* "?enum_migration_version"? [\s\S]*? \);
+        | ^-- [^\r\n]*
+        | ^SET \s+ default_with_oids \s* = \s* (true|false);
+        # Below are temporary cleanups, may be used to migrate from 9.0- to 9.1+.
+        #| ^CREATE \s+ OR \s+ REPLACE \s+ PROCEDURAL \s+ LANGUAGE [^\r\n]*
+        #| ^CREATE \s+ EXTENSION [^\r\n]*
+        #| ^ALTER \s+ PROCEDURAL \s+ LANGUAGE [^\r\n]*
+        #| ^COMMENT \s+ ON \s+ EXTENSION [^\r\n]*
+    }mxi';
 
     /**
      * Class constructor.
      *
-     * @return void
+     * @param string $migDir
+     * @param string $ini
      */
     public function __construct($migDir, $ini)
     {
-    	$this->_migDir = realpath($migDir);
-    	$this->_ini = $ini;
+        $this->_migDir = realpath($migDir);
+        $this->_ini = $ini;
         $this->_diff = isset($ini['diff'])? $ini['diff'] : "diff -U5 --ignore-all-space --ignore-blank-lines";
     }
 
@@ -55,13 +63,14 @@ class dklab_pgmigrator
      * The main class method.
      *
      * @return void
+     * @throws Exception
      */
     public function execute()
     {
         $this->log("##\n## Creating migration at " . basename($this->_migDir) . "\n##");
-    	if (!@is_dir($this->_migDir) || !is_writable($this->_migDir)) {
-    		throw new Exception("Directory '{$this->_migDir}' is not writable");
-    	}
+        if (!@is_dir($this->_migDir) || !is_writable($this->_migDir)) {
+            throw new Exception("Directory '{$this->_migDir}' is not writable");
+        }
         // Make a tmp remote database copy.
         $this->_copyFromCluster('prod');
         // Fetch database version.
@@ -92,37 +101,37 @@ class dklab_pgmigrator
         $this->_assertEquals('tmp', $dumpDev);
         // Wrap with transaction (if needed).
         if (empty($this->_ini['slonik'])) {
-	        $sql = $this->_clean("
-	            START TRANSACTION;
-	        ") . "\n\n" . trim($sql) . "\n" . $this->_clean("
-	            COMMIT;
-	        ");
+            $sql = $this->_clean("
+                START TRANSACTION;
+            ") . "\n\n" . trim($sql) . "\n" . $this->_clean("
+                COMMIT;
+            ");
         }
         // Add signature to protect files from manual changes.
         $sql = $this->_addSignature($sql);
 
         // Check if we made a change.
         if (!array_filter(array_keys($versionsAbove), array($this, 'isManualMigName')) && !$diff) {
-        	$this->log("No changes detected for " . basename($this->_migDir) . ". Release directory was not created.");
+            $this->log("No changes detected for " . basename($this->_migDir) . ". Release directory was not created.");
         } else {
-	        // Create the new migration directory and write into.
-	        if (!empty($this->_ini['no_save'])) {
-	            $this->log("Warning: NO_SAVE MODE! writing to tmp file!");
-	            $newFile = $this->_tempnam();
-	        } else {
-	            $newDir = $this->_migDir . '/' . $newVersion;
-	            if (!@mkdir($newDir)) {
-	                throw new Exception("Error creating '$newDir': " . error_get_last());
-	            }
-	            $newFile = $newDir . "/10_ddl.sql";
-	        }
-	        $sql = str_replace("\r", "", $sql); // remove "\r", they kills slonik
-	        if (!@file_put_contents($newFile, $sql)) {
-	        	unlink($newFile);
-	            rmdir($newDir);
-	            throw new Exception("Error creating '$newFile': " . var_export(error_get_last(), 1));
-	        }
-	        $this->log("RESULT: $newFile");
+            // Create the new migration directory and write into.
+            if (!empty($this->_ini['no_save'])) {
+                $this->log("Warning: NO_SAVE MODE! writing to tmp file!");
+                $newFile = $this->_tempnam();
+            } else {
+                $newDir = $this->_migDir . '/' . $newVersion;
+                if (!@mkdir($newDir)) {
+                    throw new Exception("Error creating '$newDir': " . error_get_last());
+                }
+                $newFile = $newDir . "/10_ddl.sql";
+            }
+            $sql = str_replace("\r", "", $sql); // remove "\r", they kills slonik
+            if (!@file_put_contents($newFile, $sql)) {
+                unlink($newFile);
+                rmdir($newDir);
+                throw new Exception("Error creating '$newFile': " . var_export(error_get_last(), 1));
+            }
+            $this->log("RESULT: $newFile");
         }
         return true;
     }
@@ -148,7 +157,7 @@ class dklab_pgmigrator
     {
         return preg_match('/^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}-mig$/s', $name);
     }
-    
+
     /**
      * Return true if this is a manual migration directory. 
      * 
@@ -157,9 +166,9 @@ class dklab_pgmigrator
      */
     public function isManualMigName($name)
     {
-    	return $this->isVersionNameCorrect($name) && !$this->isMigNameCorrect($name);
+        return $this->isVersionNameCorrect($name) && !$this->isMigNameCorrect($name);
     }
-    
+
     /**
      * Returns migration directory.
      * 
@@ -167,22 +176,24 @@ class dklab_pgmigrator
      */
     public function getMigDir()
     {
-    	return $this->_migDir;
+        return $this->_migDir;
     }
 
     /**
-     * Execute a give command and retirn its STDOUT.
+     * Execute a give command and return its STDOUT.
      * Unfortunately proc_open() seems to be buggy.
      *
      * @param string $cmd
      * @param string $stdin
      * @param string &$stderr
+     * @param int &$exitcode
      * @return string
      */
-    public function shell($cmd, $stdin = null, &$stderr = null)
+    public function shell($cmd, $stdin = null, &$stderr = null, &$exitcode = 0)
     {
         $this->_debug("$ $cmd" . (strlen($stdin)? " #<" . strlen($stdin) . "_bytes" : ""));
-    	$tmpIn = null;
+        $cmd = "($cmd)"; // for correct inner pipes and redirections processing, e.g. for stderr
+        $tmpIn = null;
         $tmpOut = $this->_tempnam('stdout_');
         $tmpErr = $this->_tempnam('stderr_');
         if (strlen($stdin)) {
@@ -190,7 +201,7 @@ class dklab_pgmigrator
             file_put_contents($tmpIn, $stdin);
             $cmd .= " < " . $this->_escapeshellarg($tmpIn);
         }
-        system("$cmd > " . $this->_escapeshellarg($tmpOut) . " 2> " . $this->_escapeshellarg($tmpErr));
+        system("$cmd > " . $this->_escapeshellarg($tmpOut) . " 2> " . $this->_escapeshellarg($tmpErr), $exitcode);
         $stdout = file_get_contents($tmpOut);
         $stderr = file_get_contents($tmpErr);
         @unlink($tmpOut);
@@ -206,6 +217,7 @@ class dklab_pgmigrator
      * @param string $version
      * @param bool $onlyMig  If true, only real migrations are returned.
      * @return array    Array with key - version, value - files pathnames list.
+     * @throws Exception
      */
     public function getSqlFilesAboveVersion($version, $onlyMig = false)
     {
@@ -236,7 +248,7 @@ class dklab_pgmigrator
         }
         // Remain only real migrations if needed.
         if ($onlyMig) {
-        	$aboveSqls = array();
+            $aboveSqls = array();
         }
         // Find sql files in all fetched directories.
         $files = array();
@@ -246,11 +258,11 @@ class dklab_pgmigrator
         // Verify signatures.
         foreach ($files as $version => $list) {
             if ($this->isMigNameCorrect($version)) {
-            	foreach ($list as $file) {
+                foreach ($list as $file) {
                     if (!$this->_checkSignature(file_get_contents($file))) {
                         throw new Exception("Invalid signature of '$file'. Possibly it is created manually.");
                     }
-            	}
+                }
             }
         }
         // OK, return versioned files.
@@ -266,18 +278,25 @@ class dklab_pgmigrator
      */
     private function _copyFromCluster($cluster)
     {
-    	// gzip + stdout redirect seems to be buggy on Windows
-    	$this->log("Copying database structure from 'prod'...");
+        // gzip + stdout redirect seems to be buggy on Windows
+        $this->log("Copying database structure from 'prod'...");
         $dump = $this->_pgDump($cluster, !empty($this->_ini['with_data']));
         try {
-        	// Do not use _psqlAt(), because we cannot drop a current database.
-        	$this->_runAt('tmp', array("psql -c", "DROP DATABASE %d"));
+            // Do not use _psqlAt(), because we cannot drop a current database.
+            $this->_runAt('tmp', array("psql -c", "DROP DATABASE %d"));
         } catch (Exception $e) {
             $this->_debug(trim($e->getMessage()) . " (ignoring)"); // not fatal, skip
         }
-       	// Do not use _psqlAt(), because we cannot create a current database.
-        $this->_runAt('tmp', array("psql -c", "CREATE DATABASE %d"));
-        $result = $this->_psqlAt('tmp', $dump, '--single-transaction');
+        // Do not use _psqlAt(), because we cannot create a current database.
+        $this->_runAt('tmp', array("psql -c", "CREATE DATABASE %d TEMPLATE template0"));
+        // Drop extension "plpgsql" to make tmp virgin before restoring a dump to it.
+        try {
+            $this->_psqlAt('tmp', "DROP EXTENSION IF EXISTS plpgsql");
+        } catch (Exception $e) {
+            // pass - not all postgresql versions support this
+        }
+        // Restore the dump.
+        $result = $this->_psqlAt('tmp', $dump, '--single-transaction --set ON_ERROR_STOP=1');
         $this->_debug("(executed " . strlen(preg_replace('/\s+/s', '', preg_replace('/\S+/s', '.', $result))) . " commands)");
     }
 
@@ -308,23 +327,24 @@ class dklab_pgmigrator
      * Dump the structure of a database cluster.
      *
      * @param string $cluster
+     * @param bool $withData
      * @return string
      */
     private function _pgDump($cluster, $withData = false)
     {
-    	$cmd = "pg_dump -s %d";
-    	if ($withData) {
-    	    $cmd = "pg_dump %d";
-    	}
+        $cmd = "pg_dump -s %d";
+        if ($withData) {
+            $cmd = "pg_dump %d";
+        }
 
-    	if (!empty($this->_ini['exclude'])) {
-    		foreach (preg_split('/[,\s]+/s', $this->_ini['exclude']) as $schema) {
-    			$cmd .= " -N " . $schema;
-    		}
-    	}
+        if (!empty($this->_ini['exclude'])) {
+            foreach (preg_split('/[,\s]+/s', $this->_ini['exclude']) as $schema) {
+                $cmd .= " -N " . $schema;
+            }
+        }
         $dump = $this->_runAt($cluster, $cmd);
         $this->_debug("(dumped " . strlen($dump) . " bytes)");
-    	return $dump;
+        return $dump;
     }
 
     /**
@@ -337,33 +357,37 @@ class dklab_pgmigrator
      */
     private function _applyVersions($versions)
     {
-    	$sqls = array();
-    	foreach ($versions as $version => $files) {
-    		foreach ($files as $file) {
-    			$relpath = basename(dirname($file)) . '/' . basename($file);
-    			$isMigName = $this->isMigNameCorrect($version);
-    			$sql = $this->_applySql(trim(file_get_contents($file)), $relpath, !$isMigName);
-    			if (!$isMigName) {
-    				// Append only NON-MIGRATION SQL to the resulting output.
-    				// So, at exit we have only SQLs after the latest migration.
+        $sqls = array();
+        foreach ($versions as $version => $files) {
+            foreach ($files as $file) {
+                $relpath = basename(dirname($file)) . '/' . basename($file);
+                $isMigName = $this->isMigNameCorrect($version);
+                $sql = $this->_applySql(trim(file_get_contents($file)), $relpath, !$isMigName);
+                if (!$isMigName) {
+                    // Append only NON-MIGRATION SQL to the resulting output.
+                    // So, at exit we have only SQLs after the latest migration.
                     $sqls[] = $sql;
-    			}
-    		}
-    	}
-    	return join("", $sqls);
+                }
+            }
+        }
+        return join("", $sqls);
     }
 
     /**
      * Apply SQL commands on a tmp cluster.
      *
      * @param string $sql
+     * @param string $fromFile
+     * @param $singleTrans
      * @return string   Resulting SQL after some cleanup.
      */
     private function _applySql($sql, $fromFile = null, $singleTrans = true)
     {
-    	if (empty($this->_ini['slonik'])) {
-            $sql = $this->_clean($this->_psqlInit) . "\n" . $sql;
-    	}
+        if (empty($this->_ini['slonik'])) {
+            $sql = $this->_clean($this->_psqlInit) . "\n"
+                 . (isset($this->_ini['preexec'])? rtrim($this->_clean($this->_ini['preexec']), ';') . ";\n" : "")
+                 . $sql;
+        }
         $sql = ($fromFile? "-- Applying $fromFile --\n" : "-------------------------------\n") . trim($sql);
         $this->_logSql($sql);
         $this->_psqlAt('tmp', $sql, $singleTrans? '--single-transaction' : null);
@@ -377,27 +401,28 @@ class dklab_pgmigrator
      * @param string $devCluster
      * @param string &$dumpDev       $devCluster dump is placed here.
      * @return string
+     * @throws Exception
      */
     private function _applyDiff($devCluster, &$dumpDev = null)
     {
         $this->log("Fetching search_path from '$devCluster' cluster...");
         $searchPath = trim($this->_psqlFetchCell($devCluster, "SHOW search_path"));
         $this->log("Generating <diff>...");
-    	$glob = glob($wildcard = dirname(__FILE__) . "/apgdiff-*.jar");
+        $glob = glob($wildcard = dirname(__FILE__) . "/apgdiff-*.jar");
         if (!$glob) {
             throw new Exception("Cannot find '$wildcard'");
         }
-    	$dumpTmp = $this->_pgDump('tmp');
+        $dumpTmp = $this->_pgDump('tmp');
         $dumpDev = $this->_pgDump($devCluster);
         $fileDev = $this->_tempnam('dump_' . $devCluster . "_"); file_put_contents($fileDev, $dumpDev);
         $fileTmp = $this->_tempnam('dump_tmp_'); file_put_contents($fileTmp, $dumpTmp);
         $stderr = null;
-		$jar = $glob[count($glob) - 1];
+        $jar = $glob[count($glob) - 1];
         $cmd = "java -jar " . $jar 
-        	. " --ignore-start-with " 
-        	. (preg_match('/1\.2/', basename($jar))? "--quote-names " : "")
-        	. $this->_escapeshellarg($fileTmp) . " " 
-        	. $this->_escapeshellarg($fileDev);
+            . " --ignore-start-with "
+            . (preg_match('/1\.2/', basename($jar))? "--quote-names " : "")
+            . $this->_escapeshellarg($fileTmp) . " "
+            . $this->_escapeshellarg($fileDev);
         $diff = $this->shell($cmd, null, $stderr);
         if ($stderr) {
             throw new Exception($stderr);
@@ -406,12 +431,12 @@ class dklab_pgmigrator
         $orig = $diff;
         $diff = preg_replace('/^(SET search_path = [^;]+)/m', "$1, $searchPath", $diff);
         if ($orig === $diff && strlen(trim($orig))) {
-        	throw new Exception("Cannot find 'SET search_path ...' in the dump diff");
+            throw new Exception("Cannot find 'SET search_path ...' in the dump diff");
         }
         // Remove search_path settings which does not have any other SQL command related.
         $diff = preg_replace('/(^SET search_path = [^;]+;\s*)+(^SET search_path = [^;]+;|[;\s]*\Z)/m', '$2', $diff);
         if (!preg_replace('/[\s;]+/s', '', $diff)) {
-        	return "";
+            return "";
         }
         // Unlink files only if no errors found, so we have an ability to debug.
         @unlink($fileDev);
@@ -428,7 +453,7 @@ class dklab_pgmigrator
     public function _applyPostExec()
     {
         if (!empty($this->_ini['postexec'])) {
-	        return $this->_applySql($this->_ini['postexec'], 'post-SQL');
+            return $this->_applySql($this->_ini['postexec'], 'post-SQL');
         }
         return '';
     }
@@ -442,8 +467,8 @@ class dklab_pgmigrator
     private function _getSignature($code)
     {
         // DO NOT change this method, ever!!!
-    	$code = preg_replace('/\s+/s', '', $code);
-    	return md5("a secret signature, do not generate manual: $code");
+        $code = preg_replace('/\s+/s', '', $code);
+        return md5("a secret signature, do not generate manual: $code");
     }
 
     /**
@@ -465,13 +490,16 @@ class dklab_pgmigrator
      */
     private function _checkSignature($sql)
     {
-    	$m = null;
-    	if (!preg_match('/^\s*--\s*(\S+)\s*(.*)/s', $sql, $m)) {
-    		return false;
-    	}
-    	if ($m[1] != $this->_getSignature($m[2])) {
-    		return false;
-    	}
+        $m = null;
+        if (!preg_match('/^\s*--\s*(\S+)\s*(.*)/s', $sql, $m)) {
+            return false;
+        }
+        if ($m[1] == "*") {
+            return true;
+        }
+        if ($m[1] != $this->_getSignature($m[2])) {
+            return false;
+        }
         return true;
     }
 
@@ -482,28 +510,29 @@ class dklab_pgmigrator
      * @param string $cluster
      * @param string $dumpExp
      * @return void
+     * @throws Exception
      */
     private function _assertEquals($cluster, $dumpExp)
     {
-    	$this->log("Validating the result...");
-    	$dumpTmp = $this->_pgDump($cluster);
-    	$reClean = $this->_reDiffClean;
-    	$dumpTmp = preg_replace($reClean, '', $dumpTmp);
+        $this->log("Validating the result...");
+        $dumpTmp = $this->_pgDump($cluster);
+        $reClean = $this->_reDiffClean;
+        $dumpTmp = preg_replace($reClean, '', $dumpTmp);
         $dumpExp = preg_replace($reClean, '', $dumpExp);
 
         $fingerprintTmp = $this->_getDumpFingerprint($dumpTmp);
         $fingerprintExp = $this->_getDumpFingerprint($dumpExp);
 
         if ($fingerprintTmp == $fingerprintExp) {
-        	return;
+            return;
         }
 
         $diff = $this->_diffDumps($dumpTmp, $dumpExp);
 
-    	if ($diff) {
-    	    $smartDiff = $this->_diffDumps($fingerprintTmp, $fingerprintExp);
-    	    throw new Exception("Resulting database structure does not match original:\n$diff \n\n\n !!! Smart diff: \n$smartDiff");
-    	}
+        if ($diff) {
+            $smartDiff = $this->_diffDumps($fingerprintTmp, $fingerprintExp);
+            throw new Exception("Resulting database structure does not match original:\n$diff \n\n\n### Smart diff: \n$smartDiff");
+        }
 
     }
 
@@ -525,9 +554,9 @@ class dklab_pgmigrator
 
 
         //@unlink($fileGot);
-    	//@unlink($fileExp);
+        //@unlink($fileExp);
 
-    	return $return;
+        return $return;
     }
     /**
      * Returns dump "fingerprint". For two dumps which differ only in order of operators,
@@ -538,53 +567,74 @@ class dklab_pgmigrator
      */
     private function _getDumpFingerprint($dump)
     {
-    	$dump = str_replace("\r", "", $dump);
-    	$dump = preg_replace("/\n\n+/s", "\n", $dump);
-    	$ops = preg_split('/^--\s*^--\s*Name:.*\s*^--\s*/m', $dump);
-    	sort($ops);
-    	foreach ($ops as $i => $op) {
-    		// We CARE about columns ordering!!! Else ROW() operators may be broken.
-		$ops[$i] = $op = preg_replace('/,$/m', '', $op);
-    		if (!preg_match('/^\s*CREATE TABLE /s', $op)) {
-	    		$lines = explode("\n", $op);
-	    		sort($lines);
-	    		$ops[$i] = join("\n", $lines);
-    		}
-    	}
-    	$dump = join("\n", $ops);
-    	$f = fopen($this->_tmpDir() . "/d_" . uniqid('', ''), "w"); fwrite($f, $dump); fclose($f);
-    	return $dump;
+        $dump = str_replace("\r", "", $dump);
+        $dump = preg_replace("/\n\n+/s", "\n", $dump);
+
+        // Split by named blocks and sort them t.
+        $split = preg_split(
+            '/(
+                (?:
+                    # search_path is sometimes at the end of the previous block
+                    ^SET \s+ search_path .*\s*
+                )?
+                ^-- \s*
+                ^-- \s* Name: .*\s*
+                ^-- \s*
+            )/mx',
+            $dump,
+            0,
+            PREG_SPLIT_DELIM_CAPTURE
+        );
+        $ops = array($split[0]);
+        for ($i = 1; $i < count($split); $i += 2) {
+            $ops[] = $split[$i] . $split[$i + 1];
+        }
+        sort($ops);
+
+        foreach ($ops as $i => $op) {
+            // We CARE about columns ordering!!! Else ROW() operators may be broken.
+            $ops[$i] = $op = preg_replace('/,$/m', '', $op);
+            $ops[$i] = $op = preg_replace('/,$/m', '', $op);
+            if (!preg_match('/^\s*CREATE TABLE /s', $op)) {
+                $lines = explode("\n", $op);
+                sort($lines);
+                $ops[$i] = join("\n", $lines);
+            }
+        }
+        $dump = join("\n---\n", $ops);
+        $f = fopen($this->_tmpDir() . "/d_" . uniqid('', ''), "w"); fwrite($f, $dump); fclose($f);
+        return $dump;
     }
 
     private function _psqlAt($cluster, $sql, $addArgs = null)
     {
-    	if ($addArgs) $addArgs .= " ";
-    	try {
-	    	if (false === strpos($sql, "\n")) {
-    			return $this->_runAt($cluster, array("psql -d %d {$addArgs}-c", $sql));
-	    	} else {
-	    		return $this->_runAt($cluster, "psql -d %d {$addArgs}-f %f", $sql);
-		    }
-		} catch (Exception $e) {
-			$m = null;
-			if (preg_match('/^(psql:[^:]+:)(\d+)(:.*)/s', $e->getMessage(), $m)) {
-				$line = $m[2];
-				$fromLine = max(1, $line - 20);
-				$lines = explode("\n", $sql);
-				$snip = array_slice($lines, $fromLine - 1, $line - $fromLine + 1);
-				if ($fromLine > 1) {
-					array_unshift($snip, "-- ...");
-					$fromLine--;
-				}
-				$snip[] = "-- ...";
-				$e = new Exception(
-					"Error context:\n" .
-					$this->_insertLineNumbers(join("\n", $snip), $fromLine) . "\n" .
-					"### " . "Line $line{$m[3]}"
-				);
-			}
-			throw $e;
-		}
+        if ($addArgs) $addArgs .= " ";
+        try {
+            if (false === strpos($sql, "\n")) {
+                return $this->_runAt($cluster, array("psql -d %d {$addArgs}-c", $sql));
+            } else {
+                return $this->_runAt($cluster, "psql -d %d {$addArgs}-f %f", $sql);
+            }
+        } catch (Exception $e) {
+            $m = null;
+            if (preg_match('/^(psql:[^:]+:)(\d+)(:.*)/s', $e->getMessage(), $m)) {
+                $line = $m[2];
+                $fromLine = max(1, $line - 20);
+                $lines = explode("\n", $sql);
+                $snip = array_slice($lines, $fromLine - 1, $line - $fromLine + 1);
+                if ($fromLine > 1) {
+                    array_unshift($snip, "-- ...");
+                    $fromLine--;
+                }
+                $snip[] = "-- ...";
+                $e = new Exception(
+                    "Error context:\n" .
+                    $this->_insertLineNumbers(join("\n", $snip), $fromLine) . "\n" .
+                    "### " . "Line $line{$m[3]}"
+                );
+            }
+            throw $e;
+        }
     }
 
     /**
@@ -593,7 +643,9 @@ class dklab_pgmigrator
      *
      * @param string $cluster
      * @param mixed $args
+     * @param string $stdin
      * @return string
+     * @throws Exception
      */
     private function _runAt($cluster, $args, $stdin = null)
     {
@@ -602,7 +654,7 @@ class dklab_pgmigrator
         }
         $m = $stderr = null;
         if (!preg_match('{^([^/]+)/([^/]+)$}s', $this->_ini[$cluster], $m)) {
-            throw new Exception("Invalid INI file '{$cluster}' directive format: '{$this->_ini[$cluster]}'");
+            throw new Exception("Invalid '{$cluster}' directive format: '{$this->_ini[$cluster]}'");
         }
         $host = $m[1];
         $db = $m[2];
@@ -611,31 +663,43 @@ class dklab_pgmigrator
             $args[$k] = str_replace('%d', $db, $v);
         }
         $inner = count($args) > 1? array_shift($args) . ' ' . join(' ', array_map(array($this, '_escapeshellarg'), $args)) : $args[0];
+        if (isset($this->_ini[$key = $cluster . '_env'])) {
+            $inner = $this->_ini[$key] . " " . $inner;
+        }
         if ($stdin && false !== strpos($inner, '%f')) {
-        	# This is a REMOTE tmp directory, so "/tmp" is hardcoded here.
-        	$tmp = '/tmp/stdin';
-			$inner = "cat > {$tmp}; " . str_replace('%f', $tmp, $inner);
-		}
+            # This is a REMOTE tmp directory, so "/tmp" is hardcoded here.
+            $tmp = '/tmp/stdin';
+            $inner = "cat > {$tmp}; " . str_replace('%f', $tmp, $inner);
+        }
 
-		if (!empty($this->_ini['gzipped']) && !$stdin) {
-		    $inner .= ' | gzip -9fc';
-		}
+        if (!empty($this->_ini['gzipped']) && !$stdin) {
+            $inner .= ' | gzip -9fc';
+        }
 
 
-		if (!empty($this->_ini['ssh-q'])) {
-		    $cmd = "ssh -q";
-		} else {
-		    $cmd = "ssh";
-		}
+        if (!empty($this->_ini['ssh-q'])) {
+            $cmd = "ssh -q";
+        } else {
+            $cmd = "ssh";
+        }
 
         $cmd .= " -C -o Compression=yes -o CompressionLevel=9 postgres@$host " . $this->_escapeshellarg($inner);
 
-		if (!empty($this->_ini['gzipped']) && !$stdin) {
-		    $cmd .= ' | gzip -d';
-		}
-        $result = $this->shell($cmd, $stdin, $stderr);
-        if ($stderr) {
-            throw new Exception($stderr);
+        if (!empty($this->_ini['gzipped']) && !$stdin) {
+            $cmd .= ' | gzip -d';
+        }
+        $exitcode = 0;
+        $result = $this->shell($cmd, $stdin, $stderr, $exitcode);
+        if ($exitcode) {
+            if (strlen($stderr)) {
+                throw new Exception($stderr);
+            } else {
+                throw new Exception("Exited with code $exitcode. Command-line was:\n$cmd");
+            }
+        } else {
+            if (strlen($stderr)) {
+                echo rtrim($stderr) . "\n";
+            }
         }
         return $result;
     }
@@ -644,25 +708,28 @@ class dklab_pgmigrator
      * Log a message (to STDERR).
      *
      * @param string $msg
+     * @param bool $noNl
+     * @param $noComment
+     * @param $toStderr
      * @return void
      */
     public function log($msg, $noNl = false, $noComment = false, $toStderr = false)
     {
-    	if ($this->_wasDot && !$noNl) {
-    		$msg = "\n" . $msg;
-    	} else {
-    		if (!$noComment) {
-				$msg = preg_replace('/^/m', '-- ', $msg);
-    		}
-    	}
-    	if (!$toStderr) {
-	        echo $msg . ($noNl? "" : "\n");
-    	    flush();
-    	} else {
-    		$f = fopen("php://stderr", "w");
-	        fwrite($f, $msg . ($noNl? "" : "\n"));
-	        fflush($f);
-    	}
+        if ($this->_wasDot && !$noNl) {
+            $msg = "\n" . $msg;
+        } else {
+            if (!$noComment) {
+                $msg = preg_replace('/^/m', '-- ', $msg);
+            }
+        }
+        if (!$toStderr) {
+            echo $msg . ($noNl? "" : "\n");
+            flush();
+        } else {
+            $f = fopen("php://stderr", "w");
+            fwrite($f, $msg . ($noNl? "" : "\n"));
+            fflush($f);
+        }
         $this->_wasDot = false;
     }
 
@@ -679,11 +746,11 @@ class dklab_pgmigrator
 
     private function _insertLineNumbers($sql, $fromLine = 1)
     {
-    	$lines = array();
-    	foreach (explode("\n", $sql) as $i => $line) {
-    		$lines[] = sprintf("/*%05d*/ ", $i + $fromLine) . $line;
-    	}
-    	return join("\n", $lines);
+        $lines = array();
+        foreach (explode("\n", $sql) as $i => $line) {
+            $lines[] = sprintf("/*%05d*/ ", $i + $fromLine) . $line;
+        }
+        return join("\n", $lines);
     }
 
     /**
@@ -694,12 +761,12 @@ class dklab_pgmigrator
      */
     private function _debug($msg)
     {
-    	if (!empty($this->_ini['verbose'])) {
+        if (!empty($this->_ini['verbose'])) {
             $this->log($msg);
-    	} else {
+        } else {
             //$this->log(".", true);
             //$this->_wasDot = true;
-    	}
+        }
     }
 
 
@@ -722,9 +789,9 @@ class dklab_pgmigrator
      */
     private function _tempnam($prefix = '')
     {
-    	// Seems tempnam() shrinks prefix by 3 characters...
-    	$tmp = tempnam("non-existed", '');
-    	$name = dirname($tmp) . '/' . $prefix . basename($tmp);
+        // Seems tempnam() shrinks prefix by 3 characters...
+        $tmp = tempnam(sys_get_temp_dir(), '');
+        $name = dirname($tmp) . '/' . $prefix . basename($tmp);
         @unlink($tmp);
         return $name;
     }
@@ -736,11 +803,11 @@ class dklab_pgmigrator
      */
     private function _tmpDir()
     {
-    	$tmp = getenv("TMPDIR")? getenv("TMPDIR") : (getenv("TEMP")? getenv("TEMP") : (getenv("TMP")? getenv("TMP") : "/tmp"));
-    	$tmp = str_replace('\\', '/', $tmp);
-    	return $tmp;
+        $tmp = getenv("TMPDIR")? getenv("TMPDIR") : (getenv("TEMP")? getenv("TEMP") : (getenv("TMP")? getenv("TMP") : "/tmp"));
+        $tmp = str_replace("\\", '/', $tmp);
+        return $tmp;
     }
-    
+
     /**
      * Cleans leading spaces from a string.
      * 
@@ -749,8 +816,8 @@ class dklab_pgmigrator
      */
     private function _clean($s)
     {
-    	$s = preg_replace('/^\s+/m', '', $s);
-    	return trim($s);
+        $s = preg_replace('/^\s+/m', '', $s);
+        return trim($s);
     }
 
 
@@ -766,14 +833,14 @@ class dklab_pgmigrator
      */
     public static function main()
     {
-    	$ini = self::_parseArgv();
-    	$ini['tmp'] = preg_replace('{([^/]+)$}', '_tmp_$1', $ini['dev']);
-    	$obj = new self($ini['dir'], $ini);
+        $ini = self::_parseArgv();
+        $ini['tmp'] = preg_replace('{([^/]+)$}', '_tmp_$1', $ini['dev']);
+        $obj = new self($ini['dir'], $ini);
         try {
             return $obj->execute();
         } catch (Exception $e) {
-        	$obj->log("\n### Exception: " . $e->getMessage(), false, true, true);
-        	return false;
+            $obj->log("\n### Exception: " . $e->getMessage(), false, true, true);
+            return false;
         }
         return true;
     }
@@ -782,20 +849,26 @@ class dklab_pgmigrator
      * Parses command-line arguments into associative array.
      *
      * @return array
+     * @throws Exception
      */
     private static function _parseArgv()
     {
         $ini = array();
-
         $args = array_slice($_SERVER['argv'], 1);
         for ($i = 0; $i < count($args); $i++) {
-        	if (!strlen($args[$i])) continue;
-        	$m = null;
-        	if (preg_match('/^(\S+)=(.*)/s', $args[$i], $m)) {
-        		$args[$i] = $m[1];
-        		array_splice($args, $i + 1, 0, array($m[2]));
-        	}
+            if (!strlen($args[$i])) continue;
+            if (preg_match('/^([^\s=]+)=(.*)/s', $args[$i], $m)) {
+                $args[$i] = $m[1];
+                $v = $m[2];
+                if (preg_match('/^(["\'])(.*)\1$/s', $v, $m)) {
+                    $v = stripslashes($m[2]);
+                }
+                array_splice($args, $i + 1, 0, array($v));
+            }
             switch ($args[$i]) {
+                case "--tmp-env":
+                    $ini['tmp_env'] = $args[$i + 1];
+                    break;
                 case "--dev":
                     $ini['dev'] = $args[$i + 1];
                     break;
@@ -813,6 +886,9 @@ class dklab_pgmigrator
                     break;
                 case "--postexec":
                     $ini['postexec'] = $args[$i + 1];
+                    break;
+                case "--preexec":
+                    $ini['preexec'] = $args[$i + 1];
                     break;
                 case "--no-save":
                     $ini['no_save'] = true;
@@ -859,8 +935,8 @@ class dklab_pgmigrator
         die(
             "Usage:\n" .
             "  php " . basename(__FILE__) . " --dev=host/database --prod=host/database --dir=path/to/migdir\n" .
-            "      [--postexec=\"some SQL commands\"] [--exclude=schema1,schema2,...] [--verbose]\n" .
-            "      [--diff=diff_command]\n"
+            "      [--tmp-env=\"A=b C=d\"] [--postexec=\"some SQL commands\"] [--exclude=schema1,schema2,...]\n" .
+            "      [--verbose] [--diff=diff_command]\n"
         );
     }
 }

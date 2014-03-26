@@ -11,17 +11,20 @@ way, and you take control over the whole process.
 Installation
 ------------
 
-1. Apply dklab_pgmigrator.sql to both development and production databases.
+1. Apply dklab_pgmigrator.sql initially to both development and 
+   production databases.
 
 2. Copy dklab_pgmigrator.php & apgdiff*.jar anywhere you want.
 
-3. Create private & public SSH keys which allows you to run
+3. Create private & public SSH keys which allows you to run both
 
-     $ ssh postgres@HOST pg_dump DB
+     $ ssh postgres@DEV_HOST pg_dump DEV_DB
+     $ ssh postgres@PROD_HOST pg_dump PROD_DB
 
-   without a password, where HOST and DB are both developer & production
-   hosts & database name. (Dklab_pgmigrator uses ph_dump over SSH, because
-   it is much faster than all other dumping methods.)
+   without a password, where DEV_HOST+DEV_DB and PROD_HOST+PROD_DB are 
+   both developer & production hosts + database name. (Dklab_pgmigrator 
+   uses pg_dump over SSH, because it is much faster than all other 
+   dumping methods.)
 
 4. Enjoy!
 
